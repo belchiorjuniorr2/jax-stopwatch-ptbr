@@ -1,0 +1,280 @@
+# USB Serial Protocol
+
+This document describes the USB CDC / USB Serial interface used by the CoreS3,
+StopWatch, and AtomS3R Chatbot firmware. It is intended for Android clients that
+open the device USB port with Android USB Host APIs.
+
+The existing Wi-Fi APIs remain available:
+
+- WebSocket: `ws://<stack-chan-ip>:8080/`
+- HTTP capture: `POST http://<stack-chan-ip>/capture`. This succeeds only on camera-equipped CoreS3 devices.
+
+USB Serial is an additional transport. It does not replace STA, SoftAP,
+WebSocket, or HTTP.
+
+## Startup
+
+The firmware starts USB CDC on boot with:
+
+```text
+baud: 921600
+data bits: 8
+parity: none
+stop bits: 1
+flow control: none
+```
+
+USB CDC does not use the baud rate as a physical UART clock, but the firmware
+and companion apps should use `921600` consistently so the same USB session can
+carry audio, camera, JSON, and StreetPass traffic without reconnecting at a
+different baud rate. Configure the port as 8N1 with no flow control.
+
+After opening the port, the client should wait briefly, drain any startup text,
+then send a ping. The client should not depend on DTR/RTS for protocol state.
+
+## Raw JSON Line Mode
+
+For diagnostics, the firmware accepts newline-delimited UTF-8 JSON:
+
+```json
+{"type":"ping","id":"phone_001"}
+```
+
+The line must end with `\n`. The response is also newline-delimited JSON:
+
+```json
+{"type":"pong","id":"phone_001","timestampMs":12345}
+```
+
+Raw JSON is useful for initial bring-up, but large binary payloads must use SCU1
+frames.
+
+## SCU1 Frame
+
+Binary traffic uses an SCU1 frame:
+
+```text
+magic     4 bytes  "SCU1"
+version   1 byte   0x01
+type      1 byte
+flags     1 byte
+reserved  1 byte   0x00
+seq       4 bytes  little-endian
+length    4 bytes  little-endian
+payload   length bytes
+crc32     4 bytes  little-endian
+```
+
+CRC32 is the standard IEEE CRC32 used by zlib. It covers:
+
+```text
+version, type, flags, reserved, seq, length, payload
+```
+
+The `SCU1` magic bytes and final CRC field are excluded.
+
+The current maximum payload size is `8192` bytes. TTS PCM chunks of `4096` bytes
+are recommended.
+
+## Frame Types
+
+| Type | Direction | Payload |
+| --- | --- | --- |
+| `0x01` JSON | both | UTF-8 JSON command/event |
+| `0x02` TTS PCM | client to device | raw signed 16-bit little-endian PCM, 16 kHz mono |
+| `0x03` MIC PCM | device to client | existing `MIC1` packet |
+| `0x04` capture request | client to device | JSON request payload. Fails on devices without cameras |
+| `0x05` capture image chunk | device to client | JPEG bytes. Sent only after successful CoreS3 capture |
+| `0x06` ACK | reserved | currently unused |
+| `0x07` ERROR | device to client | JSON error payload |
+| `0x08` PING | client to device | optional JSON payload |
+| `0x09` PONG | device to client | JSON payload |
+
+## Ping
+
+The firmware accepts either:
+
+- SCU1 type `0x08`
+- SCU1 type `0x01` with `{"type":"ping","id":"..."}`
+- raw JSON line `{"type":"ping","id":"..."}\n`
+
+For SCU1 type `0x08`, the firmware responds with type `0x09`. For JSON ping,
+the firmware responds in the same framed or line mode.
+
+## JSON Commands
+
+SCU1 type `0x01` carries the same JSON command/event payloads used by the
+WebSocket API. StreetPass commands use this same JSON transport.
+
+```json
+{"type":"state","value":"listening"}
+{"type":"state","value":"speaking"}
+{"type":"state","value":"idle"}
+{"type":"vad","active":false}
+{"type":"auth","result":"unknown"}
+{"type":"motion","name":"center"}
+{"type":"affection.event","id":"phone_001","event":"petting","source":"phone","intensity":1.0}
+{"type":"affection.debug_set","requestId":"phone_002","affection":700,"persist":false}
+{"type":"audio.speaker_test","requestId":"spk_001","durationMs":450}
+{"type":"audio.mic_test","requestId":"mic_001","durationMs":600}
+{"type":"streetpass.profile.get","requestId":"sp_profile_001"}
+{"type":"streetpass.encounters.get","requestId":"sp_enc_001","sinceRecordId":0,"limit":30}
+```
+
+The firmware sends JSON events such as:
+
+```json
+{"type":"affection.state","affection":720,"mood":10,"confusion":0,"levelIndex":4}
+{"type":"interaction.event","event":"camera_button","phase":"pressed","source":"device"}
+```
+
+## TTS PCM
+
+Client-to-device TTS uses SCU1 type `0x02`.
+
+```text
+format: signed 16-bit little-endian PCM
+sample rate: 16000 Hz
+channels: mono
+recommended chunk: 4096 bytes
+```
+
+Recommended sequence:
+
+1. Send SCU1 JSON `{"type":"state","value":"speaking"}`.
+2. Send one or more type `0x02` PCM frames.
+3. Send SCU1 JSON `{"type":"state","value":"idle"}`.
+
+Playback starts after the firmware prebuffer is reached. Sending `idle` at the
+end drains any remaining short buffer.
+
+On capable devices, an SCU1 type `0x01` `display.speech_bubble.cue` may precede
+each segment PCM. See [Speech Bubble Protocol v1](speech_bubble_protocol.md) for
+ordering and limits.
+
+## Microphone PCM
+
+When the device is in `listening` state and mic streaming is not muted, the
+firmware can send SCU1 type `0x03` frames. The payload is the existing `MIC1`
+packet:
+
+```text
+magic       4 bytes  "MIC1"
+seq         uint32 little-endian
+timestampMs uint32 little-endian
+sampleCount uint16 little-endian
+flags       uint16 little-endian
+payload     signed 16-bit little-endian PCM
+```
+
+`flags` bit 0 marks the start of a stream segment. The PCM is 16 kHz mono.
+
+## Step JSON
+
+On StopWatch, request a step snapshot with an SCU1 type `0x01` frame:
+
+```json
+{"type":"steps.get","requestId":"steps-001"}
+```
+
+The device sends `steps.snapshot` just after connection and on request, then
+`steps.update` as the count changes. CoreS3 and AtomS3R return `steps.error`.
+See the [Step Counter And Sync Protocol](step_counter_protocol.md) for fields,
+day rollover, and update timing.
+
+## Capture
+
+USB Serial capture uses JSON plus image chunks. It succeeds only on
+camera-equipped CoreS3 devices. StopWatch and AtomS3R Chatbot return an error
+such as `camera_not_ready`.
+
+Client request:
+
+```json
+{"type":"capture.request","id":"cap_001","format":"jpeg","maxWidth":640,"maxHeight":480}
+```
+
+Device response:
+
+```json
+{"type":"capture.start","id":"cap_001","contentType":"image/jpeg","length":123456}
+```
+
+The JPEG bytes follow as one or more SCU1 type `0x05` frames. Completion is sent
+as JSON:
+
+```json
+{"type":"capture.end","id":"cap_001","ok":true}
+```
+
+On error:
+
+```json
+{"type":"capture.end","id":"cap_001","ok":false,"error":"camera_not_ready"}
+```
+
+## Audio Diagnostics
+
+The firmware exposes simple audio diagnostics through both JSON commands and
+HTTP endpoints.
+
+Speaker test:
+
+```json
+{"type":"audio.speaker_test","requestId":"spk_001","durationMs":450}
+```
+
+Response:
+
+```json
+{"type":"audio.speaker_test","requestId":"spk_001","ok":true,"durationMs":450}
+```
+
+Mic test:
+
+```json
+{"type":"audio.mic_test","requestId":"mic_001","durationMs":600}
+```
+
+The response includes metrics such as `peak`, `rms`, `dc`, `clipCount`,
+`chunks`, and `underruns`. HTTP `/speaker-test` and `/mic-test` provide the same
+diagnostic entry points.
+
+Playback diagnostics:
+
+```json
+{"type":"audio.playback_diag","requestId":"playback-001"}
+```
+
+The response uses the same `type` and `requestId`. Its main field groups are:
+
+| Fields | Meaning |
+| --- | --- |
+| `state`, `draining`, `playbackStarted`, `speakerEnabled` | Current playback state |
+| `rxAvailable`, `rxCapacity`, `maxBufferedBytes` | PCM receive-buffer use |
+| `pcmFramesReceived`, `pcmBytesReceived`, `pcmBytesAccepted`, `pcmBytesDropped` | PCM received, accepted, and dropped |
+| `rxOverflowEvents`, `underflowResets`, `speakerQueueFullEvents`, `playRawFailEvents` | Overflow, underflow, and speaker-queue failures |
+| `playbackPcmReceivedCursor`, `playbackPcmAcceptedCursor`, `playbackPcmDequeuedCursor` | Cumulative byte positions in the playback stream |
+| `speechBubbleActive`, `speechBubbleVisible` | Bubble protocol and display state |
+| `voicePerf` | Loop, face, audio, WebSocket, and HTTP timing during speech |
+
+This read-only command is available over both WebSocket and USB Serial.
+
+## Receiver Requirements
+
+The USB CDC stream can contain diagnostic text in development builds. Clients
+must parse it as a byte stream and scan for the `SCU1` magic. If CRC fails, skip
+bytes until the next magic sequence and resynchronize.
+
+For raw JSON line mode, ignore non-JSON diagnostic lines and only parse lines
+that start with `{`.
+
+Recommended Android behavior:
+
+- Open the port.
+- Wait briefly and drain pending bytes.
+- Send SCU1 ping or raw JSON ping.
+- Keep the reader running continuously.
+- Do not block writes waiting for ACK on every PCM frame.
+- Use backpressure or small delays if the device reports CRC errors under heavy
+  PCM transfer.

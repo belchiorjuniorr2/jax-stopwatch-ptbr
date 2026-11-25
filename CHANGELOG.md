@@ -1,0 +1,127 @@
+# 更新日志
+
+本项目的重要变更都记在这里。格式参考 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，版本号遵循[语义化版本](https://semver.org/lang/zh-CN/)。固件镜像和每版的完整说明见 [Releases](https://github.com/BTCUP99/jax-stopwatch/releases)。
+
+升级时请留意标有 **⚠️ 升级须知** 的条目：是否需要刷固件、重新上传形象等。通用步骤见[安装说明 · 更新](docs/setup.md#4-更新)。
+
+## [未发布]
+
+### 新增
+- **A tela desliga sozinha** (firmware): depois de 1 minuto sem uso a tela apaga pelo mesmo caminho do botão de energia. Em Ajustes → Tela dá para escolher 30 s, 1 min, 2 min ou nunca (padrão 1 min, gravado no NVS). Não apaga durante Escutando / Pensando / Respondendo nem enquanto um job do Grok Bot está pendente. Um toque curto em qualquer botão (ou no visor) só acende a tela, sem disparar a ação; segurar A ou B com a tela apagada acende e já começa a falar (A = ChatGPT, B = Grok Bot). Se a tela for apagada no meio de um job, a resposta ainda toca (Wi-Fi e áudio continuam). Não há gesto de IMU para acordar a tela.
+
+## [0.5.4] - 2026-10-25
+
+### 新增
+- 控制台“X 提醒”可以分别勾选新粉丝、@ 提及、回复、转发、引用。取消的类型会从 X 退订，不再推送、不占 API 额度；重新勾选后自动订阅回来。只会退订本项目建立的订阅（标签 `stopwatch`），同一 X 应用里其他工具的订阅不受影响。
+
+### ⚠️ 升级须知
+- 无需刷固件（仍为 0.5.1）。更新代码后重启后台即可；默认五种都开，行为不变。
+
+## [0.5.3] - 2026-10-25
+
+### 修复
+- **手表在形象多了以后卡顿、断连**（固件 0.5.1）：设备上每次读取形象列表都要逐张查文件、统计整个存储区，放到 8 套时一次要约 12 秒，期间手表不响应触摸，Mac 等不到心跳就断开重连，滑动换形象后也会卡住。现在按文件夹一次读取文件名，并缓存切换顺序、当前形象和存储用量：读取形象列表 11.9 秒 → 0.5 秒，设备信息 0.8 秒 → 0.05 秒；滑动时的振动也不再延迟。
+
+### ⚠️ 升级须知
+- 需要刷固件：`scripts/flash.sh`（只写应用分区，Wi-Fi 配对和已上传的形象保留）。
+
+## [0.5.2] - 2026-10-25
+
+### 变更
+- 控制台“形象管理”里正在使用的形象更醒目：浅蓝底、预览图外一圈表圈式描边，左上角“使用中”标签。
+
+### ⚠️ 升级须知
+- 无需刷固件（仍为 0.5.0）。更新代码后重启后台即可。
+
+## [0.5.1] - 2026-10-25
+
+### 新增
+- `scripts/check_avatar.py`：检查形象的轮廓有没有直线切口、画布圆外有没有像素，并画出手表上的圆屏预览。
+- 控制台“形象管理”的设备存储旁显示已上传几套形象（建议不超过 8 套）。
+
+### 变更
+- 形象规范新增 2.1 节“轮廓”：主体只能以画布圆（圆周出血）或造型本身结束，不能被横线、竖线截断（半身像平切、照片沿边框裁成方块在圆屏上会是明显切口）。容量参考按实测更新：合计约 8–10 套，建议 8 套以内。
+
+### ⚠️ 升级须知
+- 无需刷固件（仍为 0.5.0）。更新代码后重启后台即可。
+- 已上传的形象不受影响；按新规范修好轮廓的形象需要重新上传。
+
+## [0.5.0] - 2026-10-25
+
+### 新增
+- **滑动换形象**（固件 0.5.0）：在手表首页左右快速滑动，切换到下一套 / 上一套形象；滑过阈值的一瞬间（手指还没抬起）就短振一下，表示已触发、新形象正在加载。状态栏上方有一排小圆点，显示一共几套、当前是第几套（只有一套时不显示）。顺序与控制台一致（内置形象 → 已上传的形象按 ID 排序），循环切换，重启后保持，不需要连着 Mac；控制台会跟着更新。
+
+### 修复
+- 设备刚重启时控制台偶尔读不到形象列表：连接后读取失败会自动重试。
+
+### 变更
+- **大笑改为快速连点三下触发**（原来是来回抚摸），与滑动彻底区分：第一下先“嘻嘻”，第三下接着“哈哈大笑”。慢慢拖动、长按都不响应，减少误触。
+
+### ⚠️ 升级须知
+- 需要刷固件：`scripts/flash.sh`（只写应用分区，Wi-Fi 配对和已上传的形象保留）。
+- 形象图片不需要重画或重新上传。
+
+## [0.4.1] - 2026-10-25
+
+### 新增
+- **摇一摇重播**：首页还有 X 提醒图标时，摇一摇手表重播最新一条。图标 30 分钟自动清除后不再响应；设备忙或 10 秒内重复摇晃不响应，减少走路甩手误触。控制台“形象管理”可关闭。
+- 控制台“预览提醒标识”附带一条可重播 2 分钟的测试提醒，方便试摇。
+
+### ⚠️ 升级须知
+- 无需刷固件（手表本来就会上报摇晃，0.3.0 起即可用）。更新代码后重启后台即可。
+
+## [0.4.0] - 2026-10-24
+
+### 新增
+- **触摸表情**（固件 0.4.0）：待机时轻点首页形象“嘻嘻”调皮，来回抚摸“哈哈”大笑，只有表情、不出声。录音、播报、任务进行中不触发。
+- 形象规范新增 4.2 节：`giggle_1/2`、`laugh_1/2` 四张触摸帧；三套自带形象已补齐。
+- 控制台“形象管理”新增触摸表情开关（保存在 `runtime/face.json`）。
+- 文档新增存储空间说明：手表留给形象约 3.4MB，三套自带形象（含触摸帧）约 1.2MB，每套自制形象约 0.3–0.5MB。
+
+### 变更
+- 首页的上游摸头动画换成触摸表情。
+- 缺少触摸帧的形象触摸时显示开心表情；内置默认脸不反应。
+
+### ⚠️ 升级须知
+- 需要刷固件：`scripts/flash.sh`（只写应用分区，Wi-Fi 配对和已上传的形象保留）。
+- 已上传的形象要插 USB 在控制台点一次“重新上传”，才会带上触摸帧；不重传也能用。
+
+## [0.3.1] - 2026-10-24
+
+### 新增
+- 数据目录可与代码分开：`JAX_HOME`、`JAX_WORKSPACE`、`JAX_AVATARS`，方便用一份发布版日常运行、另一份克隆做开发。
+- 文档：交给 AI 编程助手的安装指南（`docs/agent-install.md`）、首页布局与状态图标说明。
+
+### 修复
+- X 提醒断线后不再恢复：重连时如果 X 套餐不支持 `backfill_minutes`，改为不带该参数立即重连（断线期间的事件不会补发）。
+- 播报不再依赖 Homebrew 的 ffmpeg，改用 macOS `say` 直接输出设备格式。
+- 开机自启动沿用当前终端的 `PATH`，用 nvm 等安装的 `codex`、`cloudflared` 也能找到。
+- `flash.sh` 刷写后把后台交还给登录项，异常退出仍会自动重启。
+- 固件第三方声明补上 efontCN 字体。
+
+### ⚠️ 升级须知
+- 无需刷固件（仍为 0.3.0）。更新代码后重启后台即可。
+
+## [0.3.0] - 2026-10-23
+
+首个公开版本。
+
+### 新增
+- 按键对讲：按住 A 说话，单击 B 切换 Codex / Webhook 助手，双击 B 停止。
+- Mac 本地语音识别（MLX Whisper small）与 macOS 语音播报。
+- USB、局域网（TLS）、Tailscale Funnel 三种连接自动切换；每台设备独立密钥，只能经 USB 写入。
+- X 提醒：新粉丝、@、回复、转发、引用，振动、播报并在屏幕右侧显示图标。
+- 首页：顶部时间、底部状态栏、说话时嘴型与眨眼。
+- 形象管理：经 USB 上传形象到手表、无需刷机即可切换；三套开源形象与开心表情。
+- 固件 0.3.0，基于 stackchan-pet-fw v0.4.1。
+
+[未发布]: https://github.com/BTCUP99/jax-stopwatch/compare/v0.5.4...HEAD
+[0.5.4]: https://github.com/BTCUP99/jax-stopwatch/compare/v0.5.3...v0.5.4
+[0.5.3]: https://github.com/BTCUP99/jax-stopwatch/compare/v0.5.2...v0.5.3
+[0.5.2]: https://github.com/BTCUP99/jax-stopwatch/compare/v0.5.1...v0.5.2
+[0.5.1]: https://github.com/BTCUP99/jax-stopwatch/compare/v0.5.0...v0.5.1
+[0.5.0]: https://github.com/BTCUP99/jax-stopwatch/compare/v0.4.1...v0.5.0
+[0.4.1]: https://github.com/BTCUP99/jax-stopwatch/compare/v0.4.0...v0.4.1
+[0.4.0]: https://github.com/BTCUP99/jax-stopwatch/compare/v0.3.1...v0.4.0
+[0.3.1]: https://github.com/BTCUP99/jax-stopwatch/compare/v0.3.0...v0.3.1
+[0.3.0]: https://github.com/BTCUP99/jax-stopwatch/releases/tag/v0.3.0

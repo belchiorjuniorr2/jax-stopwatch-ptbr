@@ -1,0 +1,473 @@
+# Stack-chan Device Affection API
+
+[English](device_affection_api.md) | [日本語](device_affection_api.ja.md)
+
+この文書は、スタックチャン本体ファームウェアが公開する好感度関連の WebSocket API を説明します。
+本体側のリファレンスとして、ファームウェアが受け付けるメッセージ、保持する状態、
+返す可能性のあるレスポンスだけを記載します。
+
+外部クライアント側の実装方法、検出ロジック、UI 設計、会話処理は対象外です。
+
+## 通信
+
+WebSocket エンドポイント:
+
+```text
+ws://<stack-chan-ip>:8080/
+```
+
+text frame は UTF-8 JSON です。binary frame は音声用で、好感度メッセージには使いません。
+クライアントから本体への binary frame はスピーカー再生用の raw signed 16-bit PCM です。
+本体からクライアントへのマイク frame は 16 byte の `MIC1` header を持ちます:
+little-endian の `uint32 seq`、`uint32 timestampMs`、`uint16 sampleCount`、
+`uint16 flags` の後ろに 40 ms の signed 16-bit PCM が続きます。remote VAD が
+inactive の間は、本体側で無音と判定したときにマイク frame 送信を休止し、音量が
+戻ると保持していた pre-roll 付きで再開することがあります。`timestampMs` は WebSocket
+送信時刻ではなく、録音された PCM segment の先頭時刻です。`flags` の bit 0 は新しい
+マイク stream segment の開始を示します。
+
+HTTP `/status` でも本体状態の一部として現在の好感度値を確認できますが、
+制御の主経路は WebSocket JSON です。
+
+WebSocket クライアントが接続した直後、ファームウェアは最新の
+`affection.state` を必ず送信します。再接続時は短期状態の `mood` と
+`confusion` を `0` に戻してから state を送信します。起動時/再接続時の定型反応を使う場合は、
+その後に `interaction.event` の `session_start` を送信します。
+
+## Message: Device Info
+
+受信 JSON:
+
+```json
+{
+  "type": "device.info.get",
+  "requestId": "client-req-device-001"
+}
+```
+
+送信 JSON:
+
+```json
+{
+  "type": "device.info",
+  "requestId": "client-req-device-001",
+  "deviceId": "stackchan_8f3a21",
+  "displayName": "Stack-chan",
+  "firmwareName": "stackchan-pet-fw",
+  "firmwareVersion": "0.4.1",
+  "protocolVersion": 2,
+  "faceRenderer": "image",
+  "faceRendererMode": "animated",
+  "faceAssetSchema": 2,
+  "faceAssetManifestPresent": true,
+  "faceAssetManifestValid": true,
+  "legacyFaceFallbackActive": false,
+  "capabilities": ["device.info", "affection.get", "affection.sync", "display.speech_bubble.v1"],
+  "display": {"width": 320, "height": 240, "shape": "rect"},
+  "speechBubble": {
+    "version": 1,
+    "sampleRate": 16000,
+    "maxSequenceIdUtf8Bytes": 64,
+    "maxTextUtf8Bytes": 512,
+    "maxQueuedCues": 16,
+    "maxPcmBytes": 8388608,
+    "defaultHoldMs": 800,
+    "maxHoldMs": 5000,
+    "stallTimeoutMs": 15000,
+    "preSpeakingHoldMs": 500
+  }
+}
+```
+
+`deviceId` は初回起動時に生成してNVSに保存する安定IDです。IPアドレスやUSB接続ごとの
+一時IDではありません。保存できない場合は eFuse MAC 由来の安定IDへ fallback します。
+`faceRendererMode` は実際に選択された `classic` / `animated` / `transition` / `legacy` /
+`emergency` のいずれかです。不正なmanifestでは `faceAssetError`、画像欠落時は
+`faceAssetMissing` も追加されます。`display`と`speechBubble`は、クライアントが画面形状と
+吹き出し制限を実機から判定するための値です。StopWatchでは`capabilities`に`steps.sync`も
+追加されます。歩数JSONは[歩数カウンター／同期仕様](step_counter_protocol.ja.md)を参照してください。
+また、StopWatchでは`phone_camera.remote_shutter.v1`と
+`phone_camera.remote_lens.v1`も追加されます。対応スマホアプリはこれらのcapabilityを
+確認してから、[スマホカメラ・リモート撮影仕様](phone_camera_remote_protocol.ja.md)の
+`phone_camera.*` messageを使用してください。
+
+## 本体が保持する状態
+
+好感度状態の正本はファームウェア側が保持し、永続化します。
+
+| Field | Type | Range | Persistence | Meaning |
+| --- | --- | ---: | --- | --- |
+| `affection` | integer | `0..1000` | persistent | 長期的な好感度。`500` が通常の初期値です。 |
+| `mood` | integer | `-100..100` | temporary | 短期的な気分。 |
+| `confusion` | integer | `0..100` | temporary | 短期的な混乱/ふりふり状態。 |
+| `seq` | integer | monotonic | persistent or semi-persistent | 表示上の好感度状態が変わるたびに増えます。 |
+
+ファームウェアはイベント重み、confidence、intensity、クールダウン、重複抑制、
+範囲丸め、永続化、表示更新を本体側で処理します。
+
+`mood` と `confusion` は短期状態です。`confusion` は約 10 秒ごとに `10` ずつ
+`0` へ戻り、`mood` は約 10 秒ごとに `2` ずつ `0` へ戻ります。
+TTS 再生中または再生バッファのドレイン中は、音声再生を優先するため自然減衰と
+それに伴う `affection.state` broadcast は一時停止します。
+会話由来の好感度変化は、内部状態と `affection.state` 応答にはすぐ反映しますが、
+本体画面のハートメーターと差分表示は TTS 再生後にまとめて更新します。
+短期状態が自然減衰または再接続リセットで変化した場合も `seq` は増え、
+ファームウェアは `affection.state` を broadcast します。
+
+`seq` は状態の新旧判定に使う主軸です。`timestampMs` は本体起動後の `millis()` で、
+絶対時刻ではありません。ログ、デバッグ、短時間の `repeat` 間引き補助に使い、
+再起動をまたいだ順序比較には使わないでください。
+
+会話スタイルは5段階です。`visualTier`は旧クライアントとの互換と表示スタイル分類のため
+3段階で維持しますが、v2顔レンダラーではtierごとの静止顔画像を選びません。`legacy` fallbackでは
+互換のためこの値が参照される場合があります。
+
+| `levelIndex` | `level` | `styleId` | `visualTier` |
+| ---: | --- | --- | --- |
+| 1 | `cautious` | `cautious` | `guarded` |
+| 2 | `sulky` | `sulky` | `guarded` |
+| 3 | `normal` | `normal` | `normal` |
+| 4 | `nakayoshi` | `friendly` | `attached` |
+| 5 | `daisuki` | `attached` | `attached` |
+
+レベル境界にはヒステリシスがあり、境界付近で頻繁に `levelIndex` が上下しないようにします。
+
+## 表示動作
+
+ファームウェアは画面左側に縦型のハートメーターを表示します。
+塗りつぶし量が `affection` を表し、色も好感度に応じて変わります。
+
+参考色:
+
+```text
+0    #1A1014
+250  #5A2638
+500  #E66A9A
+750  #FF4F93
+1000 #FF2D55
+```
+
+好感度が変化すると、ハートメーター付近に `+8` や `-3` のような一時的な差分表示が出ます。
+スマホアプリ由来の会話イベントでは、TTS 再生中の描画負荷を避けるため、ハートメーターと
+差分表示は再生終了後に反映されます。
+
+## Message: Affection Event
+
+受信 JSON:
+
+```json
+{
+  "type": "affection.event",
+  "id": "client-20260514-000001",
+  "event": "praise",
+  "confidence": 0.92,
+  "intensity": 0.8,
+  "source": "phone",
+  "requestId": "client-req-0001"
+}
+```
+
+Fields:
+
+| Field | Required | Type | Firmware behavior |
+| --- | --- | --- | --- |
+| `type` | yes | string | `affection.event` である必要があります。 |
+| `id` | no | string | 指定されている場合、重複抑制に使います。 |
+| `event` | yes | string | 対応イベント名のいずれか。 |
+| `confidence` | no | number | `0.0..1.0` に丸めます。未指定時は `1.0`。 |
+| `intensity` | no | number | `0.0..1.0` に丸めます。未指定時は `1.0`。 |
+| `source` | no | string | `phone`, `app`, `device`, `debug` を受け付けます。`app` は `phone` として正規化します。 |
+| `requestId` | no | string | 該当する `affection.state` レスポンスに含めます。 |
+
+対応イベント名:
+
+```text
+talk
+positive_talk
+negative_talk
+praise
+thanks
+apology
+master_seen
+session_start
+petting
+shake
+```
+
+現在のイベント重み:
+
+| Event | Affection weight | Mood weight | Confusion weight | Cooldown |
+| --- | ---: | ---: | ---: | ---: |
+| `talk` | `+2` | `+5` | `0` | `2500 ms` |
+| `positive_talk` | `+6` | `+10` | `0` | `5000 ms` |
+| `negative_talk` | `-10` | `-20` | `0` | `8000 ms` |
+| `praise` | `+10` | `+15` | `0` | `6000 ms` |
+| `thanks` | `+6` | `+10` | `0` | `5000 ms` |
+| `apology` | `+6` | `+20` | `0` | `6000 ms` |
+| `master_seen` | `+2` | `+3` | `0` | `30000 ms` |
+| `session_start` | `0` | `+5` | `0` | `30000 ms` |
+| `petting` | `+9` | `+20` | `0` | `5000 ms` |
+| `shake` | `-5` | `-10` | `+100` | `4500 ms` |
+
+処理メモ:
+
+- 重複する `id` は無視します。
+- `confidence` と `intensity` は重み付き delta に乗算されます。
+- 正の affection delta は、`affection` が高いほど減衰します。
+- `negative_talk` は `confidence < 0.85` の場合は無視します。
+- 最終値は設定された範囲に丸めます。
+- 表示上の状態変更が適用された場合、ファームウェアは `affection.state` を broadcast します。
+- 未知の `event` は無視し、シリアルログに記録します。
+
+## Message: Get State
+
+受信 JSON:
+
+```json
+{
+  "type": "affection.get",
+  "requestId": "client-req-0002"
+}
+```
+
+送信 JSON:
+
+```json
+{
+  "type": "affection.state",
+  "requestId": "client-req-0002",
+  "seq": 128,
+  "timestampMs": 345678,
+  "affection": 642,
+  "mood": 35,
+  "confusion": 0,
+  "level": "nakayoshi",
+  "levelIndex": 4,
+  "visualTier": "attached",
+  "styleId": "friendly"
+}
+```
+
+`requestId` は任意です。指定されている場合、ファームウェアは state レスポンスに同じ値を含めます。
+`affection.get` に対しては、状態が変わっていなくても必ず `affection.state` を返します。
+
+Level values:
+
+| Range | Level |
+| ---: | --- |
+| `0..199` | `cautious` |
+| `200..399` | `sulky` |
+| `400..599` | `normal` |
+| `600..799` | `nakayoshi` |
+| `800..1000` | `daisuki` |
+
+## Message: Affection Sync State
+
+受信 JSON:
+
+```json
+{
+  "type": "affection.sync.state",
+  "requestId": "client-req-sync-001",
+  "characterId": "char_shared_001"
+}
+```
+
+送信 JSON:
+
+```json
+{
+  "type": "affection.sync.state",
+  "requestId": "client-req-sync-001",
+  "deviceId": "stackchan_8f3a21",
+  "characterId": "char_shared_001",
+  "affection": 530,
+  "mood": 0,
+  "confusion": 0,
+  "syncedBaseAffection": 500,
+  "unsyncedDelta": 30
+}
+```
+
+ファームウェアは `characterId` ごとに `syncedBaseAffection` を保存します。
+未登録の `characterId` では、現在の `affection` を同期基準値として初期化します。
+`unsyncedDelta` は `affection - syncedBaseAffection` です。
+
+## Message: Affection Sync Apply
+
+受信 JSON:
+
+```json
+{
+  "type": "affection.sync.apply",
+  "requestId": "client-req-sync-002",
+  "characterId": "char_shared_001",
+  "affection": 680
+}
+```
+
+ファームウェアの動作:
+
+- `affection` を `0..1000` に丸めて本体の現在値へ適用します。
+- `syncBaseByCharacterId[characterId]` を適用後の `affection` に更新します。
+- 表示上の好感度が変わった場合は、従来通り `affection.state` を broadcast します。
+- 適用後の確認として `affection.sync.state` を返します。
+
+## Message: Interaction Event
+
+送信 JSON:
+
+```json
+{
+  "type": "interaction.event",
+  "event": "petting",
+  "phase": "start",
+  "source": "device",
+  "seq": 128,
+  "timestampMs": 345700,
+  "affection": 650,
+  "mood": 55,
+  "confusion": 0,
+  "level": "nakayoshi",
+  "levelIndex": 4,
+  "visualTier": "attached",
+  "styleId": "friendly"
+}
+```
+
+`interaction.event` は本体で検知した物理/定型イベントを通知します。`seq` と payload 内の
+状態値は、イベントメッセージ送信時点の好感度 state snapshot です。
+
+Event values:
+
+```text
+petting
+shake
+camera_button
+session_start
+level_up
+level_down
+```
+
+Phase values:
+
+| Phase | Meaning |
+| --- | --- |
+| `start` | 継続イベントの開始。 |
+| `repeat` | 継続中または再検知。アプリ側は通常 TTS を間引きます。 |
+| `end` | 継続イベントの終了。 |
+| `instant` | `session_start`, `level_up`, `level_down` などの単発イベント。 |
+| `pressed` | `camera_button` などの本体側操作。 |
+
+`interaction.event.source` は `device` 固定です。`level_up` / `level_down` は、
+先に `affection.state` を broadcast してから送信します。
+
+`camera_button` は CoreS3 のカメラ表示を押したときに、WebSocket または USB Serial
+クライアント接続中だけ送信します。ボタンイベント用の単調増加する `seq` を含み、
+画像 binary は含みません。ネットワーク接続のクライアントは HTTP `POST /capture` を呼んで
+JPEG を取得してください。USB Serial クライアントは `capture.request` JSON message を送ります。
+送信後は、クライアントから次の text/binary 応答を受けるか 30 秒タイムアウトするまで、
+本体側で再押下を無視します。StopWatch / AtomS3R Chatbot はカメラ非搭載のため、
+このカメラ表示イベントと画像取得は使えません。
+
+## TTS と接続モード
+
+WebSocket または USB Serial クライアントが 1 つ以上接続している場合は connected mode とします。
+connected mode では、本体はテンプレート TTS を鳴らさず、本体イベント通知、表情、
+モーションのみを担当します。TTS はスマホ側が生成し、接続中の transport に合わせて本体へ送ります。
+ネットワーク接続では WebSocket binary frame、USB Serial 接続では SCU1 type `0x02` frame を使います。
+
+WebSocket / USB Serial クライアントが 0 の場合は standalone mode とみなせます。
+standalone mode での内蔵音声/効果音再生は将来拡張です。
+
+## 互換と fallback
+
+アプリ側は旧形式の `affection.state` でも動くように、`levelIndex`, `visualTier`,
+`styleId`, `timestampMs` がない場合は `normal` 相当に fallback してください。
+未知の `event`, `phase`, `styleId`, `visualTier` は無視または `normal` 相当に fallback し、
+クラッシュしないようにしてください。
+
+## Message: Reset
+
+受信 JSON:
+
+```json
+{
+  "type": "affection.reset",
+  "value": 500,
+  "requestId": "client-req-0003"
+}
+```
+
+ファームウェアの動作:
+
+- `affection` を `value` に設定し、`0..1000` に丸めます。
+- `mood` を `0` に戻します。
+- `confusion` を `0` に戻します。
+- `seq` を増やします。
+- 状態を即時保存します。
+- WebSocket または USB Serial クライアントが接続されている場合、`affection.state` を broadcast します。
+
+現在のファームウェアは、`mode` や `reason` が含まれていても無視します。
+
+## Message: Debug Adjust
+
+受信 JSON:
+
+```json
+{
+  "type": "affection.debug_adjust",
+  "delta": 25,
+  "requestId": "client-req-0004"
+}
+```
+
+ファームウェアの動作:
+
+- `delta` を `affection` に適用します。
+- 最終値を `0..1000` に丸めます。
+- このコマンドでは `mood` と `confusion` は変更しません。
+- WebSocket または USB Serial クライアントが接続されている場合、`affection.state` を broadcast します。
+
+このコマンドは調整と診断用です。
+
+## Message: Debug Set
+
+受信 JSON:
+
+```json
+{
+  "type": "affection.debug_set",
+  "levelIndex": 5,
+  "mood": 40,
+  "confusion": 0,
+  "persist": false,
+  "requestId": "client-req-0005"
+}
+```
+
+ファームウェアの動作:
+
+- デバッグUI向けに、好感度状態を直接切り替えます。
+- `levelIndex` は `1..5` に丸め、指定されたレベルの代表値へ `affection` を設定します。
+- `affection` または `value` を指定すると、生値を `0..1000` に丸めて設定します。
+- `levelIndex` と `affection` の両方がある場合は、`levelIndex` を優先します。
+- `mood` は `-100..100`、`confusion` は `0..100` に丸めます。
+- `persist` は任意です。未指定または `false` の場合、再起動後には残りません。`true` の場合は即時保存します。
+- 状態が変わった場合は `seq` を増やし、`affection.state` を broadcast します。
+- `levelIndex` が変わった場合は、`affection.state` の後に `level_up` または `level_down` の `interaction.event` を送ります。
+
+`levelIndex` の代表値:
+
+| `levelIndex` | `affection` |
+| ---: | ---: |
+| 1 | 100 |
+| 2 | 300 |
+| 3 | 500 |
+| 4 | 700 |
+| 5 | 900 |
+
+## 未対応メッセージ
+
+現在のファームウェアは、未対応または不正な好感度メッセージをシリアルログに出力します。
+構造化された `affection.error` レスポンスは現時点では送信しません。

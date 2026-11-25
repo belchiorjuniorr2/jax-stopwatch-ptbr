@@ -1,0 +1,42 @@
+# Local state and secrets — never commit
+runtime/
+workspace/
+models/
+firmware-dist/
+*.pem
+.env
+.env.local
+.env.*
+!.env.example
+
+# Firmware secrets
+firmware/src/config.h
+firmware/src/config_private.h
+firmware/src/config_relay.h
+
+# Relay / Vercel local
+relay/.env
+relay/.env.local
+relay/.vercel/
+relay/node_modules/
+
+# Python
+.venv/
+__pycache__/
+*.pyc
+
+# macOS
+.DS_Store
+
+# local build helpers and artifacts
+.pio-venv/
+.platformio-home/
+.pio/
+**/.pio/
+out-bin/
+*.elf
+*.map
+
+# editor
+.vscode/
+.idea/

@@ -1,0 +1,11 @@
+{
+  "$schema": "https://openapi.vercel.sh/vercel.json",
+  "functions": {
+    "api/*.js": { "maxDuration": 60, "memory": 1024 }
+  },
+  "rewrites": [
+    { "source": "/api/job/:id/:op(audio|cancel)", "destination": "/api/job?id=:id&op=:op" },
+    { "source": "/api/job/:id", "destination": "/api/job?id=:id" },
+    { "source": "/api/callback/:id", "destination": "/api/callback?id=:id" }
+  ]
+}

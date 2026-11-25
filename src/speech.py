@@ -1,0 +1,145 @@
+import hashlib
+import json
+import re
+import subprocess
+import threading
+import wave
+from pathlib import Path
+import numpy as np
+
+
+class Speech:
+    def __init__(self, root):
+        self.root = Path(root)
+        self.model = self.root / "models/whisper-small-mlx"
+        self.cache = self.root / "runtime/tts"
+        self.cache.mkdir(mode=0o700, exist_ok=True)
+        self.lock = threading.Lock()
+        self.last_no_speech = None
+        self.voice_file = self.root / "runtime/voice.json"
+        self.voices = portuguese_voices()
+        saved = json.loads(self.voice_file.read_text()) if self.voice_file.exists() else {}
+        self.voice = next((v for v in self.voices if v.lower().startswith("luciana")), next(iter(self.voices)))
+        self.rate = 195
+        try:
+            self.set_voice(saved.get("voice", self.voice), saved.get("rate", self.rate))
+        except ValueError:
+            pass  # An uninstalled saved voice falls back to Luciana.
+
+    def set_voice(self, voice, rate):
+        if voice not in self.voices:
+            raise ValueError("Este Mac não tem essa voz em português")
+        if not isinstance(rate, int) or not 140 <= rate <= 260:
+            raise ValueError("A velocidade deve ficar entre 140 e 260")
+        self.voice, self.rate = voice, rate
+
+    def save_voice(self):
+        saved = self.voice_file.with_suffix(".tmp")
+        saved.write_text(json.dumps({"voice": self.voice, "rate": self.rate}, ensure_ascii=False))
+        saved.chmod(0o600)
+        saved.replace(self.voice_file)
+
+    def transcribe(self, pcm, name=None):
+        samples = np.frombuffer(pcm, dtype="<i2").astype(np.float32) / 32768.0
+        if len(samples) < 6400:
+            raise ValueError("A gravação ficou curta. Segure o A, fale a frase inteira e solte")
+        samples = samples - np.mean(samples)
+        if float(np.sqrt(np.mean(samples * samples))) < 0.002:
+            raise ValueError("Não deu para ouvir. Chegue mais perto do microfone e tente de novo")
+        import mlx_whisper
+        hint = prompt(name)
+        with self.lock:
+            result = mlx_whisper.transcribe(samples, path_or_hf_repo=str(self.model), language="pt",
+                temperature=0, condition_on_previous_text=False, initial_prompt=hint, no_speech_threshold=0.6,
+                hallucination_silence_threshold=1.0, word_timestamps=True, verbose=None)
+        text = result.get("text", "").strip()
+        segments = result.get("segments", [])
+        self.last_no_speech = round(max((s.get("no_speech_prob", 0) for s in segments), default=0), 3)
+        if not text or hallucinated(text, segments, name):
+            raise ValueError("Não reconheci a fala com clareza. Tente de novo")
+        return text
+
+    def synthesize(self, text):
+        self.cache.mkdir(mode=0o700, exist_ok=True)  # a cleared cache must not break playback
+        digest = hashlib.sha256(f"{self.voice}|{self.rate}|{text}".encode()).hexdigest()
+        raw = self.cache / (digest + ".pcm")
+        if raw.exists():
+            return raw.read_bytes()
+        # `say` writes the device format (16 kHz mono s16le) directly; no ffmpeg needed.
+        wav = self.cache / (digest + ".wav")
+        subprocess.run(["/usr/bin/say", "-v", self.voice, "-r", str(self.rate), "--file-format=WAVE",
+                        "--data-format=LEI16@16000", "--channels=1", "-o", str(wav), text], check=True,
+                       stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, timeout=90)
+        with wave.open(str(wav)) as source:
+            pcm = source.readframes(source.getnframes())
+        wav.unlink(missing_ok=True)
+        raw.write_bytes(pcm)
+        raw.chmod(0o600)
+        return pcm
+
+
+def portuguese_voices():
+    """Installed Portuguese voices for `say`, by the exact name it accepts."""
+    try:
+        listing = subprocess.run(["/usr/bin/say", "-v", "?"], capture_output=True, text=True, timeout=10).stdout
+    except (OSError, subprocess.SubprocessError):
+        listing = ""
+    voices = {}
+    for line in listing.splitlines():
+        m = re.match(r"^(.+?)\s+(pt_BR|pt_PT)\s+#", line)
+        if not m:
+            continue
+        name = m.group(1).strip()
+        label = re.sub(r"\s*\(.*\)$", "", name)
+        if m.group(2) == "pt_PT":
+            label += " (Portugal)"
+        voices[name] = label
+    return voices or {"Luciana": "Luciana"}
+
+
+# Whisper's stock outputs for silence/noise, learned from video subtitles.
+STOCK_PHRASES = re.compile(r"legendas?\s*(?:by|por)|inscreva-se|deixe seu like|obrigad[oa] por assistir|amara\.org|字幕\s*(?:by|由|製作|制作)|中文字幕", re.I)
+
+
+# Biases spelling of the pet name and assistant names; Whisper may echo it on noise.
+PROMPT_TERMS = ("português do Brasil", "Codex", "Grok Bot", "assistente")
+
+
+def prompt(name=None):
+    return ". ".join(PROMPT_TERMS[:1] + ((name,) if name else ()) + PROMPT_TERMS[1:]) + "."
+
+
+def sentences(text):
+    return [s.strip() for s in re.split(r"[。！？!?.,;，,\s]+", text.lower()) if s.strip()]
+
+
+def hallucinated(text, segments, name=None):
+    """Reject noise transcriptions: low speech confidence, stock phrases, or an echoed prompt."""
+    if segments and max(s.get("no_speech_prob", 0) for s in segments) >= .5:
+        return True
+    if STOCK_PHRASES.search(text):
+        return True
+    said = sentences(text)
+    terms = set(sentences(". ".join(PROMPT_TERMS)))
+    others = [s for s in said if s != (name or "").lower()]
+    # An echoed prompt repeats its terms or lists several of them with nothing else said;
+    # "Jax, Codex" stays valid because the name itself is spoken input.
+    return bool(others) and set(others) <= terms and (len(said) != len(set(said)) or len(others) >= 2
+                                                      or "português do brasil" in others or "portugues do brasil" in others)
+
+
+def spoken_segments(text, maximum=360):
+    text = re.sub(r"```[\s\S]*?```", "O código está no Mac.", text)
+    text = re.sub(r"\[([^\]]+)\]\([^)]+\)", r"\1", text)
+    text = re.sub(r"[*#`]+", "", text)
+    if len(text) > maximum:
+        text = text[:maximum] + ". O resultado completo está no Mac."
+    # Device subtitle area is three short lines. Split longer sentences accordingly.
+    parts = re.split(r"(?<=[。！？；.!?;\n])", text)
+    out = []
+    for part in parts:
+        while len(part) > 52:
+            out.append(part[:52]); part = part[52:]
+        if part.strip():
+            out.append(part.strip())
+    return out
