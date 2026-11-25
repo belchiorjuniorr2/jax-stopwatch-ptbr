@@ -49,6 +49,7 @@
 extern FaceController faceController;
 extern AudioController audioController;
 extern bool displayOn;
+extern void noteUserActivity(unsigned long now);
 extern bool infoScreenVisible;
 void setState(ChanState state);
 void setInfoScreenVisible(bool visible);
@@ -158,25 +159,83 @@ static void tickFace() {
   faceController.update(now);
 }
 
-static void showBubble(const String& text) {
-  faceController.setSpeechBubbleText(text.c_str());
-  tickFace();
+// Generic on-screen message expiry: info/status ~3 s, errors ~5 s,
+// question/answer ~8 s after playback (or after the text is shown if no audio).
+// Live Escutando / Pensando / Respondendo stays up until that phase ends.
+enum class MsgKind : uint8_t { Info, Error, Speech };
+
+static constexpr uint32_t kMsgInfoMs = 3000;
+static constexpr uint32_t kMsgErrorMs = 5000;
+static constexpr uint32_t kMsgSpeechMs = 8000;
+
+static uint32_t bubbleClearAt = 0;
+static MsgKind bubbleKind = MsgKind::Info;
+
+static void cancelBubbleExpiry() {
+  bubbleClearAt = 0;
 }
 
 static void clearBubble() { faceController.clearSpeechBubble(); }
 
+static void clearOnScreenMessages(const char* reason) {
+  Serial.printf("[ui] bubble_clear reason=%s\n", reason ? reason : "expiry");
+  cancelBubbleExpiry();
+  clearBubble();
+}
+
+static void scheduleBubbleExpiry(MsgKind kind, uint32_t ms) {
+  bubbleKind = kind;
+  bubbleClearAt = millis() + ms;
+}
+
+static void armSpeechExpiry() {
+  scheduleBubbleExpiry(MsgKind::Speech, kMsgSpeechMs);
+}
+
+static void showBubble(const String& text, MsgKind kind) {
+  faceController.setSpeechBubbleText(text.c_str());
+  if (kind == MsgKind::Speech) {
+    // Keep Q/A / progress visible while Escutando / Pensando / Respondendo.
+    // armSpeechExpiry() starts the 8 s timer after playback (or if there is no audio).
+    bubbleKind = kind;
+    cancelBubbleExpiry();
+  } else if (kind == MsgKind::Error) {
+    scheduleBubbleExpiry(kind, kMsgErrorMs);
+  } else {
+    scheduleBubbleExpiry(kind, kMsgInfoMs);
+  }
+  tickFace();
+}
+
+static void tickBubbleExpiry() {
+  if (!bubbleClearAt) return;
+  if (faceController.voiceStatusActive()) return;
+  if ((int32_t)(millis() - bubbleClearAt) < 0) return;
+  const char* kind = (bubbleKind == MsgKind::Error) ? "error"
+                    : (bubbleKind == MsgKind::Speech) ? "speech" : "info";
+  Serial.printf("[ui] bubble_clear reason=expiry kind=%s\n", kind);
+  cancelBubbleExpiry();
+  clearBubble();
+}
+
 static void setVoiceUi(const char* status, const char* bubble = nullptr) {
+  // Clear leftover question/answer / "Relay ok" before freezing the last face.
+  if (bubble && !bubble[0]) {
+    clearOnScreenMessages("voice_ui");
+  }
   faceController.setVoiceStatus(status);
   if (bubble && bubble[0]) {
-    showBubble(bubble);
-  } else if (bubble) {
-    clearBubble();
+    showBubble(bubble, MsgKind::Speech);
   }
 }
 
-static void endVoiceUi() {
+static void endVoiceStatus() {
   faceController.setVoiceStatus("");
-  clearBubble();
+}
+
+static void endVoiceUi() {
+  endVoiceStatus();
+  clearOnScreenMessages("end_voice");
 }
 
 static void haptic(uint8_t level = 160, unsigned long ms = 80) {
@@ -690,7 +749,13 @@ static int fetchAudio(const String& url, const uint8_t* body, size_t bodyLen, St
   playRate = rate;
   setState(ChanState::Idle);
   restoreAudio();
-  endVoiceUi();
+  endVoiceStatus();
+  if (ok && lastReply.length()) {
+    showBubble(lastReply, MsgKind::Speech);
+    armSpeechExpiry();
+  } else {
+    clearOnScreenMessages("fetch_no_reply");
+  }
   faceController.shrinkSpeakingCache();
   if (!ok) {
     if (!err.length()) err = "resposta sem audio";
@@ -796,7 +861,7 @@ static void pingRelayHealth() {
   RelayCall c;
   if (!c.begin(url, 35000)) {
     Serial.printf("[relay] health begin fail %s\n", url.c_str());
-    showBubble("Wi-Fi ok, relay falhou");
+    showBubble("Wi-Fi ok, relay falhou", MsgKind::Error);
     return;
   }
   int code = c.http.GET();
@@ -815,12 +880,12 @@ static void pingRelayHealth() {
   Serial.printf("[relay] health %s -> %d %s (try=%u)\n", url.c_str(), code, body.c_str(),
                 (unsigned)healthTries);
   if (code == 200) {
-    showBubble("Relay ok");
+    showBubble("Relay ok", MsgKind::Info);
   } else if (healthTries < 5) {
     healthPending = true;
-    showBubble(String("Wi-Fi ok, tentando relay ") + String(healthTries) + "/5");
+    showBubble(String("Wi-Fi ok, tentando relay ") + String(healthTries) + "/5", MsgKind::Info);
   } else {
-    showBubble(String("Wi-Fi ok, relay ") + (code > 0 ? String(code) : "falhou"));
+    showBubble(String("Wi-Fi ok, relay ") + (code > 0 ? String(code) : "falhou"), MsgKind::Error);
   }
 }
 
@@ -830,7 +895,7 @@ static bool ensureWifi(bool force) {
   lastWifiTry = millis();
   lastLink = 4;
   faceController.setLinkState(4);
-  showBubble("Procurando Wi-Fi...");
+  showBubble("Procurando Wi-Fi...", MsgKind::Info);
   Serial.printf("[relay] procurando Wi-Fi, %u redes:", (unsigned)WIFI_COUNT);
   for (size_t i = 0; i < WIFI_COUNT; ++i) {
     Serial.printf(" %s", WIFI_LIST[i].ssid);
@@ -852,7 +917,7 @@ static bool ensureWifi(bool force) {
     lastLink = 5;
     faceController.setLinkState(5);
     Serial.println("[relay] sem Wi-Fi (2.4 GHz)");
-    showBubble("Sem Wi-Fi. Confira a rede 2.4 GHz.");
+    showBubble("Sem Wi-Fi. Confira a rede 2.4 GHz.", MsgKind::Error);
   }
   return ok;
 }
@@ -878,7 +943,13 @@ static bool playReply() {
   }
   setState(ChanState::Idle);
   restoreAudio();
-  endVoiceUi();
+  endVoiceStatus();
+  if (lastReply.length()) {
+    showBubble(lastReply, MsgKind::Speech);
+    armSpeechExpiry();
+  } else {
+    clearOnScreenMessages("play_no_reply");
+  }
   sink.release();
   playPcm = nullptr;
   playSamples = 0;
@@ -893,11 +964,12 @@ static void showError(const String& err) {
   haptic(220, 80);
   endVoiceUi();
   Serial.printf("[ui] error=%s\n", err.c_str());
-  showBubble(err);
+  showBubble(err, MsgKind::Error);
   setState(ChanState::Idle);
   restoreAudio();
   faceController.shrinkSpeakingCache();
   logMem("idle_after_error");
+  noteUserActivity(millis());
 }
 
 static int16_t recChunk[REC_CHUNK];  // internal RAM, not the loop stack
@@ -907,6 +979,9 @@ static bool recordWhileButton(m5::Button_Class& btn, const char* agentName, cons
   if (!recBuf) return false;
   logMem("hold_start");
   Serial.printf("[ui] phase=listening agent=%s\n", agentName);
+  lastTranscript = "";
+  lastReply = "";
+  clearOnScreenMessages("hold_start");
   faceController.setAgentLabel(agentName);
   pauseStreetPassRadio("relay_record");
   // Frozen last frame + bottom status; no JPEG and no bubble during record
@@ -978,7 +1053,7 @@ static void showTranscriptThenAnswer(const String& answer) {
     Serial.printf("[ui] phase=transcript chars=%u text=%s\n",
                   static_cast<unsigned>(lastTranscript.length()),
                   lastTranscript.c_str());
-    showBubble(String("Voc\xC3\xAA: ") + lastTranscript);
+    showBubble(String("Voc\xC3\xAA: ") + lastTranscript, MsgKind::Speech);
     const uint32_t until = millis() + 1400;
     while (millis() < until) {
       M5.update();
@@ -988,7 +1063,7 @@ static void showTranscriptThenAnswer(const String& answer) {
   }
   if (answer.length()) {
     Serial.printf("[ui] phase=answer chars=%u\n", static_cast<unsigned>(answer.length()));
-    showBubble(answer);
+    showBubble(answer, MsgKind::Speech);
   }
 }
 
@@ -1016,9 +1091,12 @@ static void fastConversation() {
   cancelRequested = false;
   if (!ensureWifi(true)) { sessionBusy = false; return; }
   size_t n = recordedSamples();
+  lastTranscript = "";
+  lastReply = "";
+  clearOnScreenMessages("turn_start");
   Serial.println("[ui] phase=thinking agent=ChatGPT");
   faceController.setAgentLabel("ChatGPT");
-  setVoiceUi("Pensando...", lastTranscript.length() ? (String("Voc\xC3\xAA: ") + lastTranscript).c_str() : "");
+  setVoiceUi("Pensando...", "");
   setState(ChanState::Idle);
   String err;
   String url = String(RELAY_URL);
@@ -1034,6 +1112,7 @@ static void fastConversation() {
   }
   activeBase = relayBase(url.c_str());
   sessionBusy = false;
+  noteUserActivity(millis());
 }
 
 struct JobState {
@@ -1095,7 +1174,10 @@ static void agentConversation() {
   cancelRequested = false;
   if (!ensureWifi(true)) { sessionBusy = false; return; }
   size_t n = recordedSamples();
-  setVoiceUi("Pensando...", lastTranscript.length() ? (String("Voc\xC3\xAA: ") + lastTranscript).c_str() : "");
+  lastTranscript = "";
+  lastReply = "";
+  clearOnScreenMessages("turn_start");
+  setVoiceUi("Pensando...", "");
   String out, base = relayBase(RELAY_URL);
   int code = relayJson("POST", base + "/api/agent", recBuf, WAV_HDR + n * 2, "audio/wav", out);
   if (code <= 0 && RELAY_URL_LAN[0]) {
@@ -1129,7 +1211,7 @@ static void agentConversation() {
     M5.update();
     if (M5.BtnB.wasDecideClickCount()) {
       cancelRequested = true;
-      showBubble("Cancelando...");
+      showBubble("Cancelando...", MsgKind::Info);
     }
     if (lastReply.startsWith("\x01")) {
       String prog = lastReply.substring(1);
@@ -1138,14 +1220,14 @@ static void agentConversation() {
       }
       if (prog != shown && millis() - lastDraw > 200) {
         Serial.println("[ui] phase=progress");
-        showBubble(prog);
+        showBubble(prog, MsgKind::Speech);
         shown = prog;
         lastDraw = millis();
       }
     }
     if (M5.BtnA.wasPressed() || (M5.BtnA.isPressed() && M5.BtnB.isPressed())) {
       cancelRequested = true;
-      showBubble("Cancelando...");
+      showBubble("Cancelando...", MsgKind::Info);
     }
     tickFace();
     delay(20);
@@ -1168,21 +1250,20 @@ static void agentConversation() {
   String err;
   int ac = fetchAudio(job.base + "/api/job/" + job.id + "/audio", nullptr, 0, err, false);
   if (ac != 200) {
-    showBubble(lastReply.length() ? lastReply : err);
-    uint32_t until = millis() + 8000;
-    while (millis() < until) {
-      M5.update();
-      tickFace();
-      if (M5.BtnA.wasPressed() || M5.BtnB.wasPressed()) break;
-      delay(10);
+    endVoiceStatus();
+    if (lastReply.length()) {
+      showBubble(lastReply, MsgKind::Speech);
+      armSpeechExpiry();
+    } else {
+      showError(err.length() ? err : "resposta sem audio");
     }
-    endVoiceUi();
     setState(ChanState::Idle);
     restoreAudio();
     faceController.shrinkSpeakingCache();
     logMem("idle_after_error");
   }
   sessionBusy = false;
+  noteUserActivity(millis());
 }
 
 static void updateClock() {
@@ -1213,10 +1294,10 @@ void begin() {
   for (size_t i = 0; i < WIFI_COUNT; ++i) wifiMulti.addAP(WIFI_LIST[i].ssid, WIFI_LIST[i].pass);
   recBuf = (uint8_t*)heap_caps_malloc(WAV_HDR + REC_MAX * 2 + 4, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
   if (!recBuf) {
-    showBubble("PSRAM indisponivel. Compile com PSRAM = OPI.");
+    showBubble("PSRAM indisponivel. Compile com PSRAM = OPI.", MsgKind::Error);
   }
 #ifdef RELAY_UNCONFIGURED
-  showBubble("Falta config_relay.h com Wi-Fi e o token.");
+  showBubble("Falta config_relay.h com Wi-Fi e o token.", MsgKind::Error);
 #endif
   auto mc = M5.Mic.config();
   mc.sample_rate = REC_RATE;
@@ -1232,6 +1313,7 @@ void begin() {
 void update(unsigned long now) {
   (void)now;
   pollDebugSerial();
+  tickBubbleExpiry();
   if (healthPending && WiFi.isConnected() && !sessionBusy &&
       (lastHealthMs == 0 || millis() - lastHealthMs > 2000)) {
     healthPending = false;
@@ -1270,9 +1352,7 @@ void resetConversation() {
   lastReply = "";
   lastTranscript = "";
   playSamples = 0;
-  showBubble("Nova conversa");
-  delay(800);
-  clearBubble();
+  showBubble("Nova conversa", MsgKind::Info);
 }
 
 static void openSettingsFromButtons() {
@@ -1291,6 +1371,7 @@ static void startTalk(Mode mode) {
   haptic(80, 35);
   if (mode == Mode::Agent) agentConversation();
   else fastConversation();
+  noteUserActivity(millis());
 }
 
 void startTalkFromWake(bool agent) {
@@ -1306,7 +1387,7 @@ bool handleButtons(unsigned long now) {
   if (M5.BtnA.isPressed() && M5.BtnB.isPressed()) {
     if (sessionBusy) {
       cancelRequested = true;
-      showBubble("Cancelando...");
+      showBubble("Cancelando...", MsgKind::Info);
       return true;
     }
     if (M5.BtnA.wasHold() || M5.BtnB.wasHold() ||
@@ -1321,7 +1402,7 @@ bool handleButtons(unsigned long now) {
     if (M5.BtnA.wasPressed() || M5.BtnB.wasPressed() ||
         (M5.BtnB.wasDecideClickCount() && M5.BtnB.getClickCount() >= 2)) {
       cancelRequested = true;
-      showBubble("Cancelando...");
+      showBubble("Cancelando...", MsgKind::Info);
     }
     return true;
   }

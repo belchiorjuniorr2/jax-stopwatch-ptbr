@@ -7,7 +7,13 @@
 ## [未发布]
 
 ### 新增
-- **A tela desliga sozinha** (firmware): depois de 1 minuto sem uso a tela apaga pelo mesmo caminho do botão de energia. Em Ajustes → Tela dá para escolher 30 s, 1 min, 2 min ou nunca (padrão 1 min, gravado no NVS). Não apaga durante Escutando / Pensando / Respondendo nem enquanto um job do Grok Bot está pendente. Um toque curto em qualquer botão (ou no visor) só acende a tela, sem disparar a ação; segurar A ou B com a tela apagada acende e já começa a falar (A = ChatGPT, B = Grok Bot). Se a tela for apagada no meio de um job, a resposta ainda toca (Wi-Fi e áudio continuam). Não há gesto de IMU para acordar a tela.
+- **A tela desliga sozinha** (firmware): depois de 1 minuto sem uso a tela apaga pelo mesmo caminho do botão de energia. Em Ajustes → Tela dá para escolher 30 s, 1 min, 2 min ou nunca (padrão 1 min, gravado no NVS). Não apaga durante Escutando / Pensando / Respondendo nem enquanto um job do Grok Bot está pendente. Um toque curto em qualquer botão (ou no visor) só acende a tela, sem disparar a ação; segurar A ou B com a tela apagada acende e já começa a falar (A = ChatGPT, B = Grok Bot). Se a tela for apagada no meio de um job, a resposta ainda toca (Wi-Fi e áudio continuam). Não há gesto de IMU para acordar a tela. O cronômetro de inatividade é reiniciado quando a conversa termina, para a tela não apagar cedo demais depois de uma resposta longa.
+
+### 变更
+- **Respostas mais longas** (relay `/api/voz`): o prompt pede cerca de 3 a 6 frases naturais (~20 a 40 s de fala) em vez de 1 a 3 frases curtas, e `max_tokens` sobe de 220 para 700. O teto do texto final dos jobs do Grok Bot vai de 1200 para 4000 caracteres; o cabeçalho `X-Reply` também comporta respostas mais longas. A rotina salva do Grok Bot no app ainda precisa ser atualizada à parte.
+
+### 修复
+- **Mensagens que ficavam na tela** (firmware): ao começar um novo toque em A ou B, a pergunta/resposta anterior, o "Relay ok" e qualquer outro recado saem na hora, e só aparece "Escutando...". Todas as mensagens na tela agora somem sozinhas: avisos e status em ~3 s, erros em ~5 s, pergunta e resposta em ~8 s depois que o áudio acaba (ou depois de aparecer, se não houver áudio). Durante Escutando / Pensando / Respondendo o status ao vivo permanece; quando a resposta termina, o texto fica e depois some.
 
 ## [0.5.4] - 2026-10-25
 

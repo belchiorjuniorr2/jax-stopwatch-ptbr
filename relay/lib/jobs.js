@@ -16,7 +16,7 @@ export const JOB_TIMEOUT_MS = () => Math.max(1, parseInt(env.JOB_TIMEOUT_SECONDS
 const JOB_TTL_SEC = 2 * 3600;
 const MAX_STEPS = 20;
 const MAX_STEP_CHARS = 140;
-const MAX_FINAL_CHARS = 1200;
+const MAX_FINAL_CHARS = 4000;
 const TERMINAL = new Set(['completed', 'failed', 'cancelled', 'timeout']);
 
 const jobKey = (id) => `m5voz:job:${id}`;
@@ -127,7 +127,7 @@ export async function handleAgent(req, res) {
         url: `${publicBaseUrl(req)}/api/callback/${id}`,
         token: cbToken,
         progressFormat: { status: 'progress', text: 'linha curta de progresso' },
-        format: { status: 'completed', text: 'resposta final curta em português' },
+        format: { status: 'completed', text: 'resposta final em português, 3 a 6 frases naturais' },
         failFormat: { status: 'failed', text: 'motivo curto' },
         expiresInSeconds: Math.round(JOB_TIMEOUT_MS() / 1000),
       },

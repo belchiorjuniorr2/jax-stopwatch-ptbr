@@ -7,8 +7,9 @@ const OPENAI_BASE = trimSlash(env.OPENAI_BASE_URL || 'https://api.openai.com/v1'
 
 export const DEFAULT_SYSTEM_PROMPT =
   'Você é a assistente de voz do relógio M5 do Zé. Responda sempre em português do Brasil, ' +
-  'de forma curta e conversacional, em 1 a 3 frases. Sem listas, sem markdown, sem emojis: ' +
-  'o texto vai ser falado em voz alta e mostrado numa tela pequena e redonda.';
+  'de forma natural e conversacional, em cerca de 3 a 6 frases (o bastante para uns 20 a 40 ' +
+  'segundos de fala). Sem listas, sem markdown, sem emojis: o texto vai ser falado em voz alta ' +
+  'e mostrado numa tela pequena e redonda.';
 
 // Na Vercel, sem chave NÃO cai no mock (evita disparar a rotina do Grok Bot com texto falso).
 // Para forçar mock lá: ALLOW_MOCK=1 ou *_PROVIDER=mock.
@@ -76,7 +77,7 @@ export async function chat(provider, messages, turnNumber) {
   const r = await fetch(`${base}/chat/completions`, {
     method: 'POST',
     headers: { Authorization: `Bearer ${key}`, 'Content-Type': 'application/json' },
-    body: JSON.stringify({ model, messages, max_tokens: 220, temperature: 0.7 }),
+    body: JSON.stringify({ model, messages, max_tokens: 700, temperature: 0.7 }),
   });
   await failIfBad(r, 'LLM');
   const j = await r.json();

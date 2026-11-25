@@ -38,7 +38,7 @@ export function deviceIdOf(req) {
 }
 
 // Texto para cabeçalho HTTP: UTF-8 percent-encoded (ASCII puro), limitado
-export const hdr = (s, max = 1500) => encodeURIComponent(s).slice(0, max).replace(/%[0-9A-F]?$/i, '');
+export const hdr = (s, max = 8000) => encodeURIComponent(s).slice(0, max).replace(/%[0-9A-F]?$/i, '');
 
 
 export function readJson(req, max = 64 * 1024) {

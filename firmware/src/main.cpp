@@ -10110,9 +10110,11 @@ void updateTouch(unsigned long now) {
 void updateButtons(unsigned long now) {
 #if STACKCHAN_DEVICE_STOPWATCH
   if (handleDisplayWakeButtons(now)) {
+    lastUserActivityMs = millis();
     return;
   }
   if (RelayVoice::handleButtons(now)) {
+    lastUserActivityMs = millis();
     return;
   }
   if (macBridgeEnabled && appClientConnected() && displayOn) {

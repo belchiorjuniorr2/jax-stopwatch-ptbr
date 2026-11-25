@@ -4493,7 +4493,10 @@ void FaceController::setVoiceStatus(const char* text) {
   }
   const bool entering = voiceStatus_.isEmpty() && !next.isEmpty();
   voiceStatus_ = next;
-  if (entering && canvasReady_) {
+  if (entering && canvasReady_ && !lastFaceReady_) {
+    // Prefer the pre-overlay snapshot from drawFace(). Recapturing here would
+    // bake the previous bubble ("Relay ok", last question/answer) into lastFace
+    // so clearSpeechBubble could no longer erase it.
     captureLastFace();
   }
   Serial.printf("[ui] voice_status=%s\n", voiceStatus_.isEmpty() ? "(idle)" : voiceStatus_.c_str());
