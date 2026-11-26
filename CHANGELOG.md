@@ -14,6 +14,7 @@
 
 ### 修复
 - **Mensagens que ficavam na tela** (firmware): ao começar um novo toque em A ou B, a pergunta/resposta anterior, o "Relay ok" e qualquer outro recado saem na hora, e só aparece "Escutando...". Todas as mensagens na tela agora somem sozinhas: avisos e status em ~3 s, erros em ~5 s, pergunta e resposta em ~8 s depois que o áudio acaba (ou depois de aparecer, se não houver áudio). Durante Escutando / Pensando / Respondendo o status ao vivo permanece; quando a resposta termina, o texto fica e depois some.
+- **A+B abre o menu Ajustes** (firmware): apertar os dois botões juntos (cerca de 80 ms) abre ou fecha o menu, sem começar uma conversa e sem varrer o Wi-Fi. O clique solto do B que apagava a tela (mapeamento antigo) foi desligado. O menu é uma lista redonda com título, item destacado, valores atuais (Tela, Wi-Fi, volume…) e a dica “A próximo / B escolher / A+B sair”, desenhada num sprite para não piscar. Se o tempo de tela nunca foi gravado no NVS, o padrão passa a ser 1 min; a escolha já salva do Zé não é sobrescrita.
 
 ## [0.5.4] - 2026-10-25
 

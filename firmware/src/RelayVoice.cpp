@@ -1314,12 +1314,12 @@ void update(unsigned long now) {
   (void)now;
   pollDebugSerial();
   tickBubbleExpiry();
-  if (healthPending && WiFi.isConnected() && !sessionBusy &&
+  if (healthPending && WiFi.isConnected() && !sessionBusy && !infoScreenVisible &&
       (lastHealthMs == 0 || millis() - lastHealthMs > 2000)) {
     healthPending = false;
     pingRelayHealth();
   }
-  if (!sessionBusy) {
+  if (!sessionBusy && !infoScreenVisible) {
     if (!WiFi.isConnected()) {
       lastLink = lastLink == 4 ? 4 : 5;
       if (lastWifiTry == 0 || millis() - lastWifiTry > 15000) ensureWifi(false);

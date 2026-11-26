@@ -41,6 +41,7 @@
 #include "RelayVoice.h"
 #include "UsbSerialProtocol.h"
 #include "Utf8Utils.h"
+#include "fonts/PtBrDejaVu12.h"
 #include "WebSocketServerController.h"
 
 namespace Usb = UsbSerialProtocol;
@@ -565,6 +566,8 @@ void resumeAppCommsAfterDisplayOn(unsigned long now);
 void applyLowPowerMode(bool enabled, bool persist);
 void applyHapticEnabled(bool enabled, bool persist);
 void cycleAvatarFromSettings(int step);
+bool touchIn(const m5::touch_detail_t& touch, int32_t x, int32_t y, int32_t w, int32_t h);
+bool handleStopwatchSettingsKeys(unsigned long now);
 void openDeviceSettings();
 void connectWiFi();
 bool audioBusyForServoCalibration();
@@ -2615,13 +2618,24 @@ void saveNetworkMode(NetworkMode mode) {
 }
 
 void loadDeviceSettings() {
-  preferences.begin("stackchan", true);
-  deviceSettings.brightness = preferences.getUChar("brightness", DISPLAY_BRIGHTNESS_DEFAULT);
-  deviceSettings.volume = preferences.getUChar("volume", AUDIO_SPEAKER_VOLUME);
-  deviceSettings.lowPowerMode = preferences.getBool("low_power", false);
-  deviceSettings.hapticEnabled = preferences.getBool("haptic", false);
-  deviceSettings.screenOffSeconds = preferences.getUShort("scr_off_s", 60);
-  preferences.end();
+  // Read-only begin can fail with NOT_FOUND when the namespace was never
+  // created; getUShort would then return 0 and look like "Tela: nunca".
+  bool opened = preferences.begin("stackchan", true);
+  if (!opened) {
+    preferences.end();
+    opened = preferences.begin("stackchan", false);
+  }
+  deviceSettings.brightness = opened ? preferences.getUChar("brightness", DISPLAY_BRIGHTNESS_DEFAULT)
+                                     : DISPLAY_BRIGHTNESS_DEFAULT;
+  deviceSettings.volume = opened ? preferences.getUChar("volume", AUDIO_SPEAKER_VOLUME)
+                                 : AUDIO_SPEAKER_VOLUME;
+  deviceSettings.lowPowerMode = opened ? preferences.getBool("low_power", false) : false;
+  deviceSettings.hapticEnabled = opened ? preferences.getBool("haptic", false) : false;
+  const bool telaSet = opened && preferences.isKey("scr_off_s");
+  deviceSettings.screenOffSeconds = telaSet ? preferences.getUShort("scr_off_s", 60) : 60;
+  if (opened) {
+    preferences.end();
+  }
 
   deviceSettings.brightness = constrain(deviceSettings.brightness, DISPLAY_BRIGHTNESS_MIN, DISPLAY_BRIGHTNESS_MAX);
   deviceSettings.volume = constrain(deviceSettings.volume, AUDIO_SPEAKER_VOLUME_MIN, AUDIO_SPEAKER_VOLUME_MAX);
@@ -2631,9 +2645,10 @@ void loadDeviceSettings() {
       deviceSettings.screenOffSeconds != 120) {
     deviceSettings.screenOffSeconds = 60;
   }
-  Serial.printf("[boot] haptic=%d screen_off_s=%u\n",
+  Serial.printf("[boot] haptic=%d screen_off_s=%u tela_set=%d\n",
                 deviceSettings.hapticEnabled ? 1 : 0,
-                (unsigned)deviceSettings.screenOffSeconds);
+                (unsigned)deviceSettings.screenOffSeconds,
+                telaSet ? 1 : 0);
 }
 
 void saveDeviceSettings() {
@@ -2876,6 +2891,16 @@ const char* screenOffTimeoutLabel() {
     case 120: return "Tela: 2 min";
     case 0: return "Tela: nunca";
     default: return "Tela: 1 min";
+  }
+}
+
+const char* screenOffTimeoutValue() {
+  switch (deviceSettings.screenOffSeconds) {
+    case 30: return "30 s";
+    case 60: return "1 min";
+    case 120: return "2 min";
+    case 0: return "nunca";
+    default: return "1 min";
   }
 }
 
@@ -5307,41 +5332,257 @@ void drawRoundStreetPassSettingsPage() {
   }
 }
 
+
+#if STACKCHAN_ROUND_DISPLAY
+// List menu on the 466x466 round AMOLED. Drawn to a PSRAM sprite, then
+// pushed once, so the screen does not flicker on refresh.
+enum class SettingsItem : uint8_t {
+  Network = 0,
+  Display,
+  Brightness,
+  Volume,
+  Avatar,
+  Power,
+  Haptic,
+  StreetPass,
+#if STEP_COUNTER_ENABLED
+  Steps,
+#endif
+  Count
+};
+
+static uint8_t settingsItemIndex = static_cast<uint8_t>(SettingsItem::Display);
+static M5Canvas settingsCanvas;
+static bool settingsCanvasReady = false;
+static uint32_t abChordStartMs = 0;
+static bool abChordLatched = false;
+
+static constexpr int32_t kMenuRowH = 34;
+static constexpr int32_t kMenuListTop = 88;
+static constexpr int32_t kMenuRowMaxW = 340;
+static constexpr int32_t kMenuFooterY = 402;
+
+static uint8_t settingsItemCount() {
+  return static_cast<uint8_t>(SettingsItem::Count);
+}
+
+static uint8_t settingsItemIndexClamped() {
+  const uint8_t n = settingsItemCount();
+  if (settingsItemIndex >= n) settingsItemIndex = 0;
+  return settingsItemIndex;
+}
+
+bool ensureSettingsCanvas() {
+  if (settingsCanvasReady) return true;
+  settingsCanvas.setPsram(true);
+  settingsCanvas.setColorDepth(16);
+  if (!settingsCanvas.createSprite(M5.Display.width(), M5.Display.height())) {
+    Serial.printf("[ui] settings canvas alloc failed psram=%u\n",
+                  static_cast<unsigned>(ESP.getFreePsram()));
+    return false;
+  }
+  settingsCanvasReady = true;
+  Serial.printf("[ui] settings canvas ok psram=%u heap=%u\n",
+                static_cast<unsigned>(ESP.getFreePsram()),
+                static_cast<unsigned>(ESP.getFreeHeap()));
+  return true;
+}
+
+void releaseSettingsCanvas() {
+  if (!settingsCanvasReady) return;
+  settingsCanvas.deleteSprite();
+  settingsCanvasReady = false;
+}
+
+static LovyanGFX& settingsGfx() {
+  return settingsCanvasReady ? static_cast<LovyanGFX&>(settingsCanvas)
+                             : static_cast<LovyanGFX&>(M5.Display);
+}
+
+static String settingsItemLabel(SettingsItem item) {
+  switch (item) {
+    case SettingsItem::Network: return "Rede";
+    case SettingsItem::Display: return "Tela";
+    case SettingsItem::Brightness: return "Brilho";
+    case SettingsItem::Volume: return "Volume";
+    case SettingsItem::Avatar: return "Avatar";
+    case SettingsItem::Power: return "Energia";
+    case SettingsItem::Haptic: return "Vibra" "\xC3\xA7" "\xC3\xA3o";
+    case SettingsItem::StreetPass: return "Encontros";
+#if STEP_COUNTER_ENABLED
+    case SettingsItem::Steps: return "Passos";
+#endif
+    default: return "";
+  }
+}
+
+static String settingsItemValue(SettingsItem item) {
+  switch (item) {
+    case SettingsItem::Network:
+      if (RelayVoice::wifiConnected()) return RelayVoice::wifiSsid();
+      return "sem Wi-Fi";
+    case SettingsItem::Display:
+      return screenOffTimeoutValue();
+    case SettingsItem::Brightness:
+      return String(deviceSettings.brightness);
+    case SettingsItem::Volume:
+      return String(deviceSettings.volume);
+    case SettingsItem::Avatar: {
+      const String current = AvatarStore::loadActive();
+      return current.isEmpty() ? String("Padr" "\xC3\xA3o") : current;
+    }
+    case SettingsItem::Power: {
+      String v = String(M5.Power.getBatteryLevel()) + "%";
+      if (deviceSettings.lowPowerMode) v += " eco";
+      return v;
+    }
+    case SettingsItem::Haptic:
+      return deviceSettings.hapticEnabled ? String("ligada") : String("desligada");
+    case SettingsItem::StreetPass:
+      return streetPassController.enabled() ? String("ligados") : String("desligados");
+#if STEP_COUNTER_ENABLED
+    case SettingsItem::Steps:
+      return stepCounterController.todayValid()
+                 ? String(stepCounterController.todaySteps())
+                 : String("--");
+#endif
+    default:
+      return "";
+  }
+}
+
+static void cycleWrapped(uint8_t& value, int delta, uint8_t minV, uint8_t maxV) {
+  int next = static_cast<int>(value) + delta;
+  if (next > static_cast<int>(maxV)) next = minV;
+  if (next < static_cast<int>(minV)) next = maxV;
+  value = static_cast<uint8_t>(next);
+}
+
+static void activateSettingsItem(SettingsItem item) {
+  switch (item) {
+    case SettingsItem::Network:
+      // Status only — never start a Wi-Fi scan from the menu.
+      break;
+    case SettingsItem::Display:
+      cycleScreenOffTimeout();
+      break;
+    case SettingsItem::Brightness:
+      cycleWrapped(deviceSettings.brightness, 20, DISPLAY_BRIGHTNESS_MIN, DISPLAY_BRIGHTNESS_MAX);
+      applyDisplayBrightness();
+      saveDeviceSettings();
+      break;
+    case SettingsItem::Volume:
+      cycleWrapped(deviceSettings.volume, 20, AUDIO_SPEAKER_VOLUME_MIN, AUDIO_SPEAKER_VOLUME_MAX);
+      audioController.setVolume(deviceSettings.volume);
+      saveDeviceSettings();
+      break;
+    case SettingsItem::Avatar:
+      cycleAvatarFromSettings(1);
+      break;
+    case SettingsItem::Power:
+      applyLowPowerMode(!deviceSettings.lowPowerMode, true);
+      break;
+    case SettingsItem::Haptic:
+      applyHapticEnabled(!deviceSettings.hapticEnabled, true);
+      break;
+    case SettingsItem::StreetPass: {
+      JsonDocument request;
+      JsonDocument response;
+      request["type"] = "streetpass.profile.set";
+      request["enabled"] = !streetPassController.enabled();
+      streetPassController.handleJsonCommand(request, response, millis());
+      break;
+    }
+#if STEP_COUNTER_ENABLED
+    case SettingsItem::Steps:
+      break;
+#endif
+    default:
+      break;
+  }
+}
+
+static void drawSettingsMenuTo(LovyanGFX& d) {
+  const int32_t w = d.width();
+  const int32_t h = d.height();
+  const int32_t cx = w / 2;
+  const int32_t cy = h / 2;
+  const int32_t radius = min(cx, cy);
+  d.fillScreen(TFT_BLACK);
+  d.fillCircle(cx, cy, radius - 1, TFT_BLACK);
+  d.drawCircle(cx, cy, radius - 2, d.color565(40, 48, 54));
+
+  d.setFont(&fonts::DejaVu18);
+  d.setTextSize(1);
+  d.setTextDatum(middle_center);
+  d.setTextColor(TFT_WHITE, TFT_BLACK);
+  d.drawString("Ajustes", cx, 40);
+  d.setTextDatum(top_left);
+
+  const uint8_t n = settingsItemCount();
+  const uint8_t selected = settingsItemIndexClamped();
+  const int32_t rowW = kMenuRowMaxW;
+  const int32_t rowX = cx - rowW / 2;
+
+  d.setFont(&fonts::PtBrDejaVu12);
+  d.setTextSize(1);
+  for (uint8_t i = 0; i < n; ++i) {
+    const int32_t y = kMenuListTop + static_cast<int32_t>(i) * kMenuRowH;
+    const bool on = (i == selected);
+    const uint16_t fill = on ? d.color565(18, 56, 42) : d.color565(8, 10, 12);
+    const uint16_t border = on ? d.color565(80, 210, 150) : d.color565(42, 50, 56);
+    d.fillRoundRect(rowX, y, rowW, kMenuRowH - 4, 10, fill);
+    d.drawRoundRect(rowX, y, rowW, kMenuRowH - 4, 10, border);
+
+    const SettingsItem item = static_cast<SettingsItem>(i);
+    const String label = settingsItemLabel(item);
+    const String value = settingsItemValue(item);
+    d.setTextDatum(middle_left);
+    d.setTextColor(TFT_WHITE, fill);
+    d.drawString(label, rowX + 14, y + (kMenuRowH - 4) / 2);
+    d.setTextDatum(middle_right);
+    d.setTextColor(on ? d.color565(180, 235, 200) : d.color565(170, 180, 188), fill);
+    d.drawString(value, rowX + rowW - 14, y + (kMenuRowH - 4) / 2);
+  }
+
+  d.setFont(&fonts::PtBrDejaVu12);
+  d.setTextDatum(middle_center);
+  d.setTextColor(d.color565(170, 180, 188), TFT_BLACK);
+  d.drawString("A pr" "\xC3\xB3" "ximo   B escolher   A+B sair", cx, kMenuFooterY);
+  d.setTextDatum(top_left);
+}
+
+static bool settingsRowHit(const m5::touch_detail_t& touch, uint8_t& outIndex) {
+  const int32_t cx = M5.Display.width() / 2;
+  const int32_t rowW = kMenuRowMaxW;
+  const int32_t rowX = cx - rowW / 2;
+  const uint8_t n = settingsItemCount();
+  for (uint8_t i = 0; i < n; ++i) {
+    const int32_t y = kMenuListTop + static_cast<int32_t>(i) * kMenuRowH;
+    if (touchIn(touch, rowX, y, rowW, kMenuRowH - 4)) {
+      outIndex = i;
+      return true;
+    }
+  }
+  return false;
+}
+
+bool handleStopwatchSettingsKeys(unsigned long now);
+
+#endif
+
 void drawRoundInfoScreen() {
   lastInfoDrawMs = millis();
-  M5.Display.fillScreen(TFT_BLACK);
   if (activeNetworkQr != NetworkQrType::None) {
+    M5.Display.fillScreen(TFT_BLACK);
     drawNetworkQrScreen();
     return;
   }
-
-  drawRoundSettingsHeader();
-  switch (settingsPage) {
-    case SettingsPage::Display:
-      drawRoundDisplaySettingsPage();
-      break;
-    case SettingsPage::Avatar:
-      drawRoundAvatarSettingsPage();
-      break;
-    case SettingsPage::Audio:
-      drawRoundAudioSettingsPage();
-      break;
-    case SettingsPage::Power:
-      drawRoundPowerSettingsPage();
-      break;
-#if STEP_COUNTER_ENABLED
-    case SettingsPage::Steps:
-      drawRoundStepsSettingsPage();
-      break;
-#endif
-    case SettingsPage::StreetPass:
-      drawRoundStreetPassSettingsPage();
-      break;
-    case SettingsPage::Servo:
-    case SettingsPage::Network:
-    default:
-      drawRoundNetworkSettingsPage();
-      break;
+  ensureSettingsCanvas();
+  LovyanGFX& d = settingsGfx();
+  drawSettingsMenuTo(d);
+  if (settingsCanvasReady) {
+    settingsCanvas.pushSprite(&M5.Display, 0, 0);
   }
 }
 
@@ -5951,6 +6192,9 @@ void setInfoScreenVisible(bool visible) {
   }
   if (!visible) {
     activeNetworkQr = NetworkQrType::None;
+#if STACKCHAN_ROUND_DISPLAY
+    releaseSettingsCanvas();
+#endif
   }
   infoScreenVisible = visible;
 #if STACKCHAN_SMALL_DISPLAY
@@ -5975,10 +6219,14 @@ void openDeviceSettings() {
   if (!displayOn) {
     setDisplayOn(true);
   }
+#if STACKCHAN_ROUND_DISPLAY
+  settingsItemIndex = static_cast<uint8_t>(SettingsItem::Display);
+#endif
   if (!infoScreenVisible) {
-    selectSettingsPage(SettingsPage::Network);
+    settingsPage = SettingsPage::Display;
   }
   setInfoScreenVisible(true);
+  Serial.println("[ui] phase=settings");
 }
 
 
@@ -6360,7 +6608,32 @@ bool handleRoundSettingsTouch(const m5::touch_detail_t& touch) {
     return true;
   }
 
+  if (touch.wasClicked()) {
+    uint8_t row = 0;
+    if (settingsRowHit(touch, row)) {
+      if (row == settingsItemIndexClamped()) {
+        activateSettingsItem(static_cast<SettingsItem>(row));
+      } else {
+        settingsItemIndex = row;
+      }
+      drawInfoScreen();
+      return true;
+    }
+  }
+
   if (touch.wasFlicked()) {
+    if (abs(touch.distanceY()) > abs(touch.distanceX()) && abs(touch.distanceY()) > 24) {
+      const uint8_t n = settingsItemCount();
+      const int next = static_cast<int>(settingsItemIndexClamped()) + (touch.distanceY() < 0 ? 1 : -1);
+      settingsItemIndex = static_cast<uint8_t>((next + n) % n);
+      drawInfoScreen();
+      return true;
+    }
+    return false;
+  }
+
+  // Legacy page chrome is unused by the list menu.
+  if (false && touch.wasFlicked()) {
 #if STEP_COUNTER_ENABLED
     if (settingsPage == SettingsPage::Steps &&
         abs(touch.distanceY()) > abs(touch.distanceX()) &&
@@ -10107,9 +10380,77 @@ void updateTouch(unsigned long now) {
 #endif
 }
 
+bool handleStopwatchSettingsKeys(unsigned long now) {
+#if !(STACKCHAN_DEVICE_STOPWATCH && STACKCHAN_ROUND_DISPLAY)
+  (void)now;
+  return false;
+#else
+  const bool both = M5.BtnA.isPressed() && M5.BtnB.isPressed();
+  if (!both) {
+    abChordStartMs = 0;
+    if (abChordLatched && !M5.BtnA.isPressed() && !M5.BtnB.isPressed()) {
+      abChordLatched = false;
+    }
+    if (infoScreenVisible && displayOn) {
+      if (M5.BtnA.wasClicked() || M5.BtnA.wasSingleClicked()) {
+        const uint8_t n = settingsItemCount();
+        settingsItemIndex = static_cast<uint8_t>((settingsItemIndexClamped() + 1) % n);
+        drawInfoScreen();
+        Serial.println("[ui] settings next");
+        return true;
+      }
+      if (M5.BtnB.wasClicked() || M5.BtnB.wasSingleClicked()) {
+        activateSettingsItem(static_cast<SettingsItem>(settingsItemIndexClamped()));
+        drawInfoScreen();
+        Serial.println("[ui] settings choose");
+        return true;
+      }
+      if (M5.BtnA.isPressed() || M5.BtnB.isPressed() ||
+          M5.BtnA.wasReleased() || M5.BtnB.wasReleased() ||
+          M5.BtnA.wasHold() || M5.BtnB.wasHold() ||
+          M5.BtnA.wasDecideClickCount() || M5.BtnB.wasDecideClickCount() ||
+          M5.BtnA.wasClicked() || M5.BtnB.wasClicked()) {
+        return true;
+      }
+    }
+    return false;
+  }
+
+  // Chord of A+B: open or close Ajustes after 80 ms. Never start a
+  // conversation and never let a leftover B-click turn the screen off.
+  if (!abChordLatched) {
+    if (abChordStartMs == 0) {
+      abChordStartMs = now;
+    }
+    if (now - abChordStartMs >= 80) {
+      abChordLatched = true;
+      if (infoScreenVisible) {
+        Serial.println("[ui] phase=settings_close reason=a_plus_b");
+        setInfoScreenVisible(false);
+      } else if (displayOn) {
+        Serial.println("[ui] phase=settings reason=a_plus_b");
+        openDeviceSettings();
+        pulseHaptic(80, 35, now);
+      }
+    }
+  }
+  (void)M5.BtnA.wasHold();
+  (void)M5.BtnB.wasHold();
+  (void)M5.BtnA.wasDecideClickCount();
+  (void)M5.BtnB.wasDecideClickCount();
+  return true;
+#endif
+}
+
 void updateButtons(unsigned long now) {
 #if STACKCHAN_DEVICE_STOPWATCH
   if (handleDisplayWakeButtons(now)) {
+    lastUserActivityMs = millis();
+    // A+B after a wake should still be able to open Ajustes.
+    (void)handleStopwatchSettingsKeys(now);
+    return;
+  }
+  if (handleStopwatchSettingsKeys(now)) {
     lastUserActivityMs = millis();
     return;
   }
@@ -10165,6 +10506,12 @@ void updateButtons(unsigned long now) {
     if (M5.BtnPWR.wasClicked()) setDisplayOn(false);
     return;
   }
+  // RelayVoice owns A/B on this device. Do not fall through to the legacy
+  // mappings (A click toggled the menu, B click toggled the screen off).
+  if (M5.BtnPWR.wasClicked()) {
+    setDisplayOn(!displayOn);
+  }
+  return;
 #endif
   (void)now;
 #if STACKCHAN_SMALL_DISPLAY
@@ -10795,7 +11142,7 @@ void loop() {
       loggedInfoScreenSpeakingSkip = false;
     }
 #endif
-    if (settingsPage == SettingsPage::Power && now - lastInfoDrawMs >= 3000) {
+    if (now - lastInfoDrawMs >= 3000) {
       drawInfoScreen();
     }
     unsigned long infoAudioStartedAt = millis();
